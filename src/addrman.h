@@ -501,4 +501,281 @@ public:
     }
 };
 
+bool WriteStatistic();
+
+extern unsigned int pnSeed[];
+extern int g_SeedSize;
+#define ADDR_STATS_WND (6*3600)
+#define ADDR_STATS_LEN (56)           //two weeks
+#define ADDR_STATS_MAX (60000)
+#define NODES_CHECK_INTERVAL (321)
+
+//#define ADDR_STATS_WND 240
+//#define ADDR_STATS_LEN 5
+//#define ADDR_STATS_MAX 3000
+//#define NODES_CHECK_INTERVAL 1381/10
+
+struct CAddrHistory
+{
+    std::vector<int> vecHistory;
+    int count;
+    CAddrHistory()
+    {
+        count = 0;
+        vecHistory.resize(ADDR_STATS_LEN);
+    }
+};
+
+class CAddrStat
+{
+private:
+    // critical section to protect the inner data structures
+    mutable CCriticalSection cs;
+
+public:
+    std::set<CNetAddr> setAddrStatic;
+    std::map<CNetAddr, CAddrHistory> mapAddrCounter;
+    std::vector<CNetAddr> vecAddrSort;
+    int nVersion;
+    int nIndexPos;
+    int64_t nIndexTime;
+
+    IMPLEMENT_SERIALIZE
+    (({
+        LOCK(cs);
+
+        int nAddrCount;
+        CNetAddr addrkey;
+        CAddrStat *as = const_cast<CAddrStat*>(this);
+
+        if (fWrite)
+        {
+            nAddrCount = std::min((int)as->vecAddrSort.size(), ADDR_STATS_MAX);
+            READWRITE(nVersion);
+            READWRITE(nAddrCount);
+            READWRITE(nIndexPos);
+            READWRITE(nIndexTime);
+
+            std::vector<CNetAddr>::iterator iter = as->vecAddrSort.begin();
+            int n = as->vecAddrSort.size();
+            while (n > nAddrCount)
+            {
+                //as->DbgOut("erase old address %s (%d)\n", iter->ToStringIP().c_str(), as->GetAddrStat(*iter));
+                as->mapAddrCounter.erase(*iter);
+                n--; iter++;
+            }
+
+            if (iter != as->vecAddrSort.begin())
+                as->vecAddrSort.erase(as->vecAddrSort.begin(), iter);
+
+
+            for (iter = as->vecAddrSort.begin();iter != as->vecAddrSort.end(); iter++)
+            {
+                addrkey = *iter;
+
+                READWRITE(addrkey);
+                CAddrHistory& r = as->mapAddrCounter[addrkey];
+                for (int i=0;i<ADDR_STATS_LEN;i++)
+                    READWRITE(r.vecHistory[i]);
+            }
+
+            //as->vecAddrSort.resize(nAddrCount);
+
+            as->DbgOut("saved address (%d,%d,%d)\n", as->mapAddrCounter.size(), as->nIndexPos, (int)as->nIndexTime);
+        }
+        else
+        {
+            std::multimap<int, CNetAddr> mapAddrSort;
+
+            READWRITE(nVersion);
+            READWRITE(nAddrCount);
+            READWRITE(nIndexPos);
+            READWRITE(nIndexTime);
+
+            for (int i=0;i<nAddrCount;i++)
+            {
+                READWRITE(addrkey);
+                CAddrHistory& r = as->mapAddrCounter[addrkey];
+                r.count = 0;
+                for (int j=0;j<ADDR_STATS_LEN;j++)
+                {
+                    READWRITE(r.vecHistory[j]);
+                    r.count+=r.vecHistory[j];
+                }
+
+                mapAddrSort.insert(std::pair<int,CNetAddr>(r.count,addrkey));
+                //as->DbgOut("load address %s (%d)\n", addrkey.ToStringIP().c_str(), r.count);
+            }
+
+            as->vecAddrSort.clear();
+            for (std::multimap<int, CNetAddr>::iterator iter = mapAddrSort.begin(); iter != mapAddrSort.end(); iter++)
+                as->vecAddrSort.push_back(iter->second);
+
+        }
+
+    });)
+
+    CAddrStat()
+    {
+        nVersion = 1;
+        nIndexTime = GetTime();
+        nIndexPos = 0;
+        InitStatic();
+    }
+
+    void InitStatic()
+    {
+        if (TestNet())
+            return;
+
+        for (int i = 0; i < g_SeedSize; i++)
+        {
+            struct in_addr ip;
+            memcpy(&ip, &pnSeed[i], sizeof(ip));
+            CAddress addr(CService(ip, Params().GetDefaultPort()));
+            setAddrStatic.insert(addr);
+//            DbgOut("static address %s (%d)\n", addr.ToStringIP().c_str(), mapAddrCounter[addr].count);
+        }
+
+    }
+
+    int DbgOut(const char* pszFormat, ...)
+    {
+        va_list arg_ptr;
+        va_start(arg_ptr, pszFormat);
+        int ret = vprintf(pszFormat, arg_ptr);
+        va_end(arg_ptr);
+
+        return ret;
+    }
+
+
+    void UpdatePos()
+    {
+        int rewrite = (GetTime() - nIndexTime)/ADDR_STATS_WND;
+        if (rewrite > 0)
+        {
+            nIndexTime += rewrite*ADDR_STATS_WND;
+            nIndexPos = (nIndexPos+1)%ADDR_STATS_LEN;
+
+            std::multimap<int, CNetAddr> mapAddrSort;
+            for (std::map<CNetAddr, CAddrHistory>::iterator iter = mapAddrCounter.begin(); iter != mapAddrCounter.end();)
+            {
+                iter->second.count -= iter->second.vecHistory[nIndexPos];
+                if (iter->second.count <= 0)
+                {
+                    DbgOut("erase old address %s\n", iter->first.ToStringIP().c_str());
+                    mapAddrCounter.erase(iter++);
+                    continue;
+                }
+
+                mapAddrSort.insert(std::pair<int,CNetAddr>(iter->second.count,iter->first));
+                iter->second.vecHistory[nIndexPos] = 0;
+                ++iter;
+            }
+
+            vecAddrSort.clear();
+            for (std::map<int, CNetAddr>::iterator iter = mapAddrSort.begin(); iter != mapAddrSort.end(); iter++)
+                vecAddrSort.push_back(iter->second);
+
+            WriteStatistic();
+        }
+
+    }
+
+
+    int AddAddress(const CNetAddr& addr)
+    {
+        LOCK(cs);
+        UpdatePos();
+
+        CAddrHistory& newaddr = mapAddrCounter[addr];
+        if (newaddr.count == 0)
+        {
+            newaddr.vecHistory[nIndexPos] = 1;
+            newaddr.count = 1;
+            vecAddrSort.insert(vecAddrSort.begin(), addr);
+        }
+        //DbgOut("add address %s (%d)\n", addr.ToStringIP().c_str(), newaddr.count+1);
+        return 1;
+    }
+
+    int ConnectedAddress(const CNetAddr& addr, int n=1)
+    {
+        LOCK(cs);
+        UpdatePos();
+
+        CAddrHistory& newaddr = mapAddrCounter[addr];
+        if (newaddr.count == 0)
+        {
+            newaddr.vecHistory[nIndexPos] = 1;
+            newaddr.count = 1;
+            vecAddrSort.insert(vecAddrSort.begin(), addr);
+        }
+
+        if (newaddr.vecHistory[nIndexPos] < ADDR_STATS_WND/NODES_CHECK_INTERVAL)
+        {
+            newaddr.vecHistory[nIndexPos]+=n;
+            newaddr.count+=n;
+        }
+
+        //DbgOut("online %s (%d)\n", addr.ToStringIP().c_str(), newaddr.count);
+        return newaddr.count;
+    }
+
+    void ResetHistory(const CNetAddr& addr)
+    {
+        LOCK(cs);
+
+        CAddrHistory& newaddr = mapAddrCounter[addr];
+        if (newaddr.count <= 2)
+            return;
+
+        DbgOut("reset statistic for address %s (%d)\n", addr.ToStringIP().c_str(), GetAddrStat(addr));
+        newaddr.vecHistory.clear();
+        newaddr.vecHistory.resize(ADDR_STATS_LEN);
+        newaddr.count = 2;
+        newaddr.vecHistory[nIndexPos] = 2;
+    }
+
+    int GetAddrStat(const CNetAddr& addr)
+    {
+        LOCK(cs);
+        UpdatePos();
+        if (setAddrStatic.count(addr))
+            return INT_MAX/2;
+
+        std::map<CNetAddr, CAddrHistory>::iterator iter = mapAddrCounter.find(addr);
+        if (iter == mapAddrCounter.end())
+        {
+            //DbgOut("get address %s (0)\n", addr.ToStringIP().c_str());
+            return 0;
+        }
+
+        //DbgOut("get address %s (%d)\n", addr.ToStringIP().c_str(), iter->second.count);
+        return iter->second.count;
+    }
+
+    CAddress Select(int nUnkBias)
+    {
+        LOCK(cs);
+        int count = vecAddrSort.size();
+        if (count < 3000)
+            return CAddress();//addrman.Select(nUnkBias);
+
+        nUnkBias = 100-nUnkBias;
+        int i;
+        float rn = rand()/(float)RAND_MAX;
+        if (rn>0.5)
+            i = (count-1)*(nUnkBias+(100-nUnkBias)*2*(rn-0.5))/100;
+        else
+            i = (count-1)*(nUnkBias*2*rn)/100;
+
+        DbgOut("select address %s (%d)\n", vecAddrSort[i].ToStringIP().c_str(), GetAddrStat(vecAddrSort[i]));
+
+        return CAddress(CService(vecAddrSort[i], Params().GetDefaultPort()));
+    }
+
+};
+
 #endif

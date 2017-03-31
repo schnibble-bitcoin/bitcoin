@@ -16,6 +16,7 @@
 #include "txmempool.h"
 #include "ui_interface.h"
 #include "util.h"
+#include "wallet.h"
 
 #include <sstream>
 
@@ -211,8 +212,10 @@ struct CNodeState {
     int nBlocksToDownload;
     int64_t nLastBlockReceive;
     int64_t nLastBlockProcess;
+    CAddress addr;
 
-    CNodeState() {
+    CNodeState(const CAddress& _addr) {
+		addr =_addr;
         nMisbehavior = 0;
         fShouldBan = false;
         nBlocksToDownload = 0;
@@ -241,7 +244,7 @@ int GetHeight()
 
 void InitializeNode(NodeId nodeid, const CNode *pnode) {
     LOCK(cs_main);
-    CNodeState &state = mapNodeState.insert(std::make_pair(nodeid, CNodeState())).first->second;
+    CNodeState &state = mapNodeState.insert(std::make_pair(nodeid, CNodeState(pnode->addr))).first->second;
     state.name = pnode->addrName;
 }
 
@@ -1423,9 +1426,11 @@ void Misbehaving(NodeId pnode, int howmuch)
     {
         LogPrintf("Misbehaving: %s (%d -> %d) BAN THRESHOLD EXCEEDED\n", state->name, state->nMisbehavior-howmuch, state->nMisbehavior);
         state->fShouldBan = true;
+        addrstat.ConnectedAddress(state->addr, (6*3600)/(NODES_CHECK_INTERVAL));
     } else
         LogPrintf("Misbehaving: %s (%d -> %d)\n", state->name, state->nMisbehavior-howmuch, state->nMisbehavior);
 }
+
 
 void static InvalidChainFound(CBlockIndex* pindexNew)
 {
@@ -1469,7 +1474,7 @@ void static InvalidBlockFound(CBlockIndex *pindex, const CValidationState &state
 
 void UpdateTime(CBlockHeader& block, const CBlockIndex* pindexPrev)
 {
-    block.nTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
+    block.nTime = max(pindexPrev->GetMedianTimePast()+1, min(statNodes.GetBestRelayTime()+1, GetAdjustedTime() + 60 * 60));
 
     // Updating time can change work required on testnet:
     if (TestNet())
@@ -2123,14 +2128,19 @@ bool ActivateBestChain(CValidationState &state) {
             }
         }
     }
-
+    
     if (chainActive.Tip() != pindexOldTip) {
-        std::string strCmd = GetArg("-blocknotify", "");
-        if (!IsInitialBlockDownload() && !strCmd.empty())
-        {
-            boost::replace_all(strCmd, "%s", chainActive.Tip()->GetBlockHash().GetHex());
-            boost::thread t(runCommand, strCmd); // thread runs free
-        }
+        //std::string strCmd = GetArg("-blocknotify", "");
+        //if (!IsInitialBlockDownload() && !strCmd.empty())
+        //{
+        //    boost::replace_all(strCmd, "%s", chainActive.Tip()->GetBlockHash().GetHex());
+        //    boost::thread t(runCommand, strCmd); // thread runs free
+        //}
+        
+		if (statNodes.IsUpdateBlockMode() && GetTime() - (int)statNodes.bestblocktime > 0)
+			statNodes.DbgOut("bonus: additional work for %d seconds\n", (int)GetTime() - (int)statNodes.bestblocktime);
+
+		statNodes.ResetUpdateBlockMode(chainActive.Tip()->GetBlockHash());
     }
 
     return true;
@@ -2179,6 +2189,12 @@ bool AddToBlockIndex(CBlock& block, CValidationState& state, const CDiskBlockPos
     {
         // Clear fork warning if its no longer applicable
         CheckForkWarningConditions();
+        
+        if (statNodes.IsUpdateBlockMode())
+            statNodes.DbgOut("warning: orphaned work for %d seconds\n", (int)GetTime() - (int)statNodes.bestblocktime);
+
+        statNodes.ResetUpdateBlockMode(chainActive.Tip()->GetBlockHash());
+        
         // Notify UI to display prev block's coinbase if it was ours
         static uint256 hashPrevBestCoinBase;
         g_signals.UpdatedTransaction(hashPrevBestCoinBase);
@@ -2498,6 +2514,10 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
 
     // Check for duplicate
     uint256 hash = pblock->GetHash();
+    
+	statNodes.DbgOut("BLOCK from %s (recvtime=%u, timeoffset=%d): %s\n", pfrom? pfrom->addr.ToStringIP().c_str() : "OURSELF!", (int)time(NULL), (int)pblock->GetBlockTime()-(int)time(NULL),
+				 hash.ToString().c_str() );
+                     
     if (mapBlockIndex.count(hash))
         return state.Invalid(error("ProcessBlock() : already have block %d %s", mapBlockIndex[hash]->nHeight, hash.ToString()), 0, "duplicate");
     if (mapOrphanBlocks.count(hash))
@@ -2584,6 +2604,9 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
         mapOrphanBlocksByPrev.erase(hashPrev);
     }
 
+    if (!pfrom)
+        statNodes.NotifySolution();
+        
     LogPrintf("ProcessBlock: ACCEPTED\n");
     return true;
 }
@@ -3369,7 +3392,24 @@ void static ProcessGetData(CNode* pfrom)
     }
 }
 
-bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
+bool IsOldInventory(const CInv& inv)
+{
+    if (inv.type == MSG_TX)
+    {
+        CWalletTx wtx;
+        uint256 hashBlock = 0;
+        if (GetTransaction(inv.hash, wtx, hashBlock, true))
+            return !wtx.fFromMe;
+    }
+    else if (inv.type == MSG_BLOCK)
+    {
+        return chainActive.Tip()->GetBlockHash() != inv.hash;
+    }
+
+    return false;
+}
+
+bool /*static*/ ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 {
     RandAddSeedPerfmon();
     LogPrint("net", "received: %s (%u bytes)\n", strCommand, vRecv.size());
@@ -3388,6 +3428,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
     if (strCommand == "version")
     {
+		addrstat.ConnectedAddress(pfrom->addr);
+		
         // Each connection can only send one version message
         if (pfrom->nVersion != 0)
         {
@@ -3445,6 +3487,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             pfrom->PushVersion();
 
         pfrom->fClient = !(pfrom->nServices & NODE_NETWORK);
+
+        pfrom->dTimeOffset=nTime-time(NULL);
+        statNodes.DbgOut("%s timeoffset = %d\n", pfrom->addr.ToStringIP().c_str(), (int)pfrom->dTimeOffset);
 
 
         // Change version
@@ -3597,6 +3642,31 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             bool fAlreadyHave = AlreadyHave(inv);
             LogPrint("net", "  got inventory: %s  %s\n", inv.ToString(), fAlreadyHave ? "have" : "new");
 
+
+            if (fAlreadyHave)
+            {
+                statNodes.AddInv(inv, pfrom);
+            }
+            else
+            {
+                statNodes.NewInv(inv, pfrom);
+                //statNodes.DbgOut("askfor %s %s   %"PRI64d"\n", pfrom->addr.ToStringIP().c_str(), inv.ToString().c_str(), mapAlreadyAskedFor[inv]);
+
+//                if (inv.type == MSG_BLOCK)
+//                {
+//                    // Relay inventory, but don't relay old inventory during initial block download
+
+//                    if (statNodes.IsUpdateBlockMode() && statNodes.GetLastBlockHash() == inv.hash)
+//                    {
+//                        LOCK(cs_vNodes);
+//                        BOOST_FOREACH(CNode* pnode, vNodes)
+//                            pnode->PushInventory(inv);
+//                    }
+//                }
+
+            }
+
+
             if (!fAlreadyHave) {
                 if (!fImporting && !fReindex) {
                     if (inv.type == MSG_BLOCK)
@@ -3646,6 +3716,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         // Find the last block the caller has in the main chain
         CBlockIndex* pindex = chainActive.FindFork(locator);
 
+        if (pindex && (pindex->nHeight < chainActive.Height()-50) && !statNodes.IsPrivateNode(pfrom))
+        {
+            pindex = NULL;
+            //pfrom->CloseSocketDisconnect();
+            pfrom->fDisconnect = true;
+        }
+        
         // Send the rest of the chain
         if (pindex)
             pindex = chainActive.Next(pindex);
@@ -3726,6 +3803,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         CValidationState state;
         if (AcceptToMemoryPool(mempool, state, tx, true, &fMissingInputs))
         {
+			statNodes.DbgOut("TX from %s : %s\n", pfrom? pfrom->addr.ToStringIP().c_str() : "OURSELF!", inv.hash.ToString().c_str() );
+            //statNodes.NewInv(inv, pfrom);
+            
             mempool.check(pcoinsTip);
             RelayTransaction(tx, inv.hash);
             mapAlreadyAskedFor.erase(inv);
@@ -4052,6 +4132,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 // requires LOCK(cs_vRecvMsg)
 bool ProcessMessages(CNode* pfrom)
 {
+	// resume all delayed messages
+    statNodes.ResumeMessages(pfrom);
+    
     //if (fDebug)
     //    LogPrintf("ProcessMessages(%u messages)\n", pfrom->vRecvMsg.size());
 
@@ -4124,10 +4207,11 @@ bool ProcessMessages(CNode* pfrom)
         }
 
         // Process message
-        bool fRet = false;
+        bool fRet = statNodes.DelayMessage(pfrom, strCommand, vRecv);//false;
         try
         {
-            fRet = ProcessMessage(pfrom, strCommand, vRecv);
+			if (!fRet)
+				fRet = ProcessMessage(pfrom, strCommand, vRecv);
             boost::this_thread::interruption_point();
         }
         catch (std::ios_base::failure& e)
@@ -4186,7 +4270,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             // RPC ping request by user
             pingSend = true;
         }
-        if (pto->nLastSend && GetTime() - pto->nLastSend > 30 * 60 && pto->vSendMsg.empty()) {
+        if (pto->nLastSend && GetTime() - pto->nLastSend > /*30*/2 * 60 && pto->vSendMsg.empty()) {
             // Ping automatically sent as a keepalive
             pingSend = true;
         }
@@ -4209,7 +4293,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         }
 
         TRY_LOCK(cs_main, lockMain); // Acquire cs_main for IsInitialBlockDownload() and CNodeState()
-        if (!lockMain)
+        if (!lockMain || !statNodes.AllowSend(pto))
             return true;
 
         // Address refresh broadcast
@@ -4316,6 +4400,16 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     hashRand = Hash(BEGIN(hashRand), END(hashRand));
                     bool fTrickleWait = ((hashRand & 3) != 0);
 
+                    // always trickle our own transactions
+                    if (!fTrickleWait)
+                    {
+                        CWalletTx wtx;
+                        uint256 hashBlock = 0;
+                        if (GetTransaction(inv.hash, wtx, hashBlock, true))
+                            if (wtx.fFromMe)
+                                fTrickleWait = true;
+                    }
+                    
                     if (fTrickleWait)
                     {
                         vInvWait.push_back(inv);
@@ -4326,6 +4420,16 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 // returns true if wasn't already contained in the set
                 if (pto->setInventoryKnown.insert(inv).second)
                 {
+					
+					statNodes.InventoryHold(pto, inv);
+
+                    if (!IsOldInventory(inv) && !pto->fDisconnect)
+                        statNodes.DbgOut(" > %s (%d)   (%2.2f)      %s %s        %s %s\n", pto->addr.ToStringIP().c_str(),
+                                                        addrstat.GetAddrStat(pto->addr),
+                                                        statNodes.NodeAvgLatency(pto)/1000.,
+                                                        fSendTrickle? "PASS": "BLAST", statNodes.IsPrivateInv(inv)? "PRIVATE" : "foreign",
+                                                        (inv.type==MSG_BLOCK)? "block" : "tx", inv.hash.ToString().c_str() );
+
                     vInv.push_back(inv);
                     if (vInv.size() >= 1000)
                     {

@@ -5,7 +5,6 @@
 
 #include "db.h"
 
-#include "addrman.h"
 #include "hash.h"
 #include "protocol.h"
 #include "util.h"
@@ -476,4 +475,31 @@ void CDBEnv::Flush(bool fShutdown)
         }
     }
 }
+
+
+//
+// CAddrStatDB
+//
+
+bool CAddrStatDB::LoadStatistic()
+{
+    if (Read(std::string("addrstat"), addrstat))
+    {
+        addrstat.DbgOut("Loaded statistic for %i addresses\n", addrstat.mapAddrCounter.size());
+        return true;
+    }
+    return false;
+}
+
+bool LoadStatistic()
+{
+    return CAddrStatDB("cr+").LoadStatistic();
+}
+
+bool WriteStatistic()
+{
+    CAddrStatDB asdb;
+    return asdb.WriteStatistic(addrstat);
+}
+
 

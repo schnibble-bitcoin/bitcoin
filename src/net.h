@@ -28,9 +28,13 @@
 #include <boost/signals2/signal.hpp>
 #include <openssl/rand.h>
 
-class CAddrMan;
+#include "addrman.h"
+//class CAddrMan;
 class CBlockIndex;
 class CNode;
+
+class CStatNodes;
+extern CStatNodes statNodes;
 
 namespace boost {
     class thread_group;
@@ -101,6 +105,7 @@ extern bool fDiscover;
 extern uint64_t nLocalServices;
 extern uint64_t nLocalHostNonce;
 extern CAddrMan addrman;
+extern CAddrStat addrstat;
 extern int nMaxConnections;
 
 extern std::vector<CNode*> vNodes;
@@ -236,6 +241,8 @@ public:
     CBloomFilter* pfilter;
     int nRefCount;
     NodeId id;
+    int64_t dTimeOffset;
+    
 protected:
 
     // Denial-of-service detection/prevention
@@ -345,6 +352,11 @@ private:
 
 public:
 
+    int64_t GetTimeAdjusted()
+    {
+        return time(NULL) + dTimeOffset;
+    }
+
     NodeId GetId() const {
       return id;
     }
@@ -390,6 +402,7 @@ public:
 
     void AddAddressKnown(const CAddress& addr)
     {
+        addrstat.AddAddress(addr);
         setAddrKnown.insert(addr);
     }
 
@@ -411,14 +424,14 @@ public:
         }
     }
 
-    void PushInventory(const CInv& inv)
-    {
-        {
-            LOCK(cs_inventory);
-            if (!setInventoryKnown.count(inv))
-                vInventoryToSend.push_back(inv);
-        }
-    }
+    void PushInventory(const CInv& inv);
+//    {
+//        {
+//            LOCK(cs_inventory);
+//            if (!setInventoryKnown.count(inv))
+//                vInventoryToSend.push_back(inv);
+//        }
+//    }
 
     void AskFor(const CInv& inv)
     {
@@ -722,5 +735,238 @@ public:
     bool Write(const CAddrMan& addr);
     bool Read(CAddrMan& addr);
 };
+
+
+
+#define UPDATE_BLOCK_TIMEOUT 120
+
+struct CMsg
+{
+    std::string cmd;
+    CDataStream ds;
+    CMsg(std::string& _cmd, CDataStream& _ds) : cmd(_cmd), ds(_ds) {}
+};
+
+struct CNodeStat
+{
+    std::multiset<int64_t> setHistory;
+    std::map<CInv, int64_t> mapRemoved;
+    std::vector<CInv> vecRemoved;
+    int64_t sum;
+
+    void Add(int64_t dt, const CInv& inv)
+    {
+        while (setHistory.size() >= 100)
+        {
+            std::set<int64_t>::iterator last = --setHistory.end();
+            sum -= *setHistory.begin() + *last;
+            setHistory.erase(setHistory.begin());
+            setHistory.erase(last);
+        }
+
+        sum += dt;
+        setHistory.insert(dt);
+
+        std::map<CInv, int64_t>::iterator iter = mapRemoved.find(inv);
+        if (iter != mapRemoved.end())
+        {
+            //recover recently removed value
+            sum += iter->second;
+            setHistory.insert(iter->second);
+            mapRemoved.erase(iter);
+        }
+    }
+
+    void Remove(const CInv& inv)
+    {
+        if (setHistory.size() <= 4)
+            return;
+
+        if (setHistory.size() == 5)
+        {
+            std::set<int64_t>::iterator last = --setHistory.end();
+            sum -= *setHistory.begin() + *last;
+            setHistory.erase(setHistory.begin());
+            setHistory.erase(last);
+        }
+
+        while (vecRemoved.size() > 20)
+        {
+            mapRemoved.erase(vecRemoved.front());
+            vecRemoved.erase(vecRemoved.begin());
+        }
+
+        mapRemoved[inv] = *setHistory.begin();
+        vecRemoved.push_back(inv);
+
+        sum -= *setHistory.begin();
+        setHistory.erase(setHistory.begin());
+
+    }
+
+    int64_t GetLatency()
+    {
+        int n = setHistory.size();
+        return n>0? sum/n : 0;
+    }
+};
+
+class CStatNodes
+{
+    uint256 bestblockhash;
+    CAddress bestblockfrom;
+
+    int64_t lastcheck;
+
+    int64_t privatetime;
+    int privatemode;
+    CInv privateinv;
+    CAddress privaterelay;
+    std::map<CAddress, std::vector<CMsg*> > mapDelayedMessages;
+
+    CCriticalSection cs;
+    std::map<CInv, int64_t> mapInvTime;
+    std::vector< std::pair<int64_t, CInv> > vecTimeInv;
+    std::map<CNetAddr, CNodeStat> mapNodeStat;
+    //std::vector< std::pair<int64_t, CInv> > vecTimeOld;
+    //std::set<CInv> setOldInv;
+
+public:
+        unsigned int bestblocktime;
+        std::set<CNetAddr> incomeaddr;
+
+public:
+    CStatNodes()
+    {
+        bestblocktime = 0;
+
+        privatemode = 0;
+        privatetime = 0;
+        lastcheck = 0;
+    }
+
+
+    void InventoryHold(CNode* pnode, const CInv& inv)
+    {
+        LOCK(cs);
+        mapNodeStat[pnode->addr].Remove(inv);
+    }
+
+    void NewNode(CNode* pnode)
+    {
+        LOCK(cs);
+        mapNodeStat.erase(pnode->addr);
+
+        /*for(std::map<CInv, int64_t>::iterator it = mapInvTime.begin();
+              it != mapInvTime.end(); it++)
+        {
+            pnode->setInventoryKnown.insert(it->first);
+        }*/
+    }
+
+    void DisconnectNode(CNode* pnode)
+    {
+        LOCK(cs);
+        mapNodeStat.erase(pnode->addr);
+    }
+
+    bool NodeIsAlive(CNode* pnode)
+    {
+        LOCK(cs);
+        return !mapNodeStat[pnode->addr].setHistory.empty();
+    }
+
+    bool IsPrivateNode(CNode* pnode)
+    {
+        return !pnode || pnode->addr.IsLocal() || pnode->addr.IsRFC1918();
+    }
+
+    bool IsPrivateInv(const CInv& inv)
+    {
+        LOCK(cs);
+        return mapInvTime.count(inv) == 0;
+    }
+
+
+    /*void OldInv(const CInv& inv)
+    {
+        LOCK(cs);
+        setOldInv.insert(inv);
+    }
+
+    bool IsOldInv(const CInv& inv)
+    {
+        LOCK(cs);
+        return setOldInv.count(inv);
+    }*/
+
+    int GetPrivateMode()
+    {
+        LOCK(cs);
+        if (privatemode == 0)
+            return 0;
+
+        if (GetTime() - privatetime > 15)
+            privatemode = 0;
+
+        return privatemode;
+    }
+
+    void SetPrivateMode(int n)
+    {
+        LOCK(cs);
+        privatemode = n;
+
+        DbgOut("set private mode %d\n", n);
+    }
+
+
+    bool IsUpdateBlockMode()
+    {
+        return (GetTime() - bestblocktime < UPDATE_BLOCK_TIMEOUT);
+    }
+
+    void NotifySolution();
+    void ResetUpdateBlockMode(const uint256& hash);
+    void SetUpdateBlockMode(const uint256& hash, const CAddress& addr);
+    void CheckUpdateBlockMode(std::vector<CNode*>& vNodesCopy);
+    uint256 GetBestBlockHash();
+    uint256& GetLastBlockHash()
+    {
+            return bestblockhash;
+    }
+
+
+    CNode* GetBestRelay();
+    int64_t GetBestRelayTime();
+    void SetPrivateMode(const CInv& inv);
+    bool AllowRelay(const CInv& inv, CNode* pnode);
+    bool AllowSend(CNode* pnode);
+    bool DelayMessage(CNode* pfrom, std::string strCommand, CDataStream& vRecv);
+    void ResumeMessages(CNode* pnode);
+
+    void NewInv(const CInv& inv, CNode* pfrom);
+    void AddInv(const CInv& inv, CNode* pfrom);
+    void OldInv(const CInv& inv);
+    void CheckHistory(int64_t nTime);
+
+    int NodeAvgLatency(CNode* pnode);
+    CNode* SelectTrickle(std::vector<CNode*>& vNodesCopy);
+    void CheckNodes();
+
+
+
+    int DbgOut(const char* pszFormat, ...)
+    {
+        std::string strF = DateTimeStrFormat("%x %H:%M:%S   ", time(NULL)) + std::string(pszFormat);
+        va_list arg_ptr;
+        va_start(arg_ptr, pszFormat);
+        int ret = vprintf(strF.c_str(), arg_ptr);
+        va_end(arg_ptr);
+
+        return ret;
+    }
+};
+
 
 #endif

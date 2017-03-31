@@ -13,6 +13,7 @@
 #include "chainparams.h"
 #include "core.h"
 #include "ui_interface.h"
+#include "main.h"
 
 #ifdef WIN32
 #include <string.h>
@@ -39,7 +40,7 @@
 using namespace std;
 using namespace boost;
 
-static const int MAX_OUTBOUND_CONNECTIONS = 8;
+static const int MAX_OUTBOUND_CONNECTIONS = 20;
 
 bool OpenNetworkConnection(const CAddress& addrConnect, CSemaphoreGrant *grantOutbound = NULL, const char *strDest = NULL, bool fOneShot = false);
 
@@ -58,6 +59,8 @@ static CNode* pnodeSync = NULL;
 uint64_t nLocalHostNonce = 0;
 static std::vector<SOCKET> vhListenSocket;
 CAddrMan addrman;
+CAddrStat addrstat;
+
 int nMaxConnections = 125;
 
 vector<CNode*> vNodes;
@@ -502,6 +505,7 @@ CNode* ConnectNode(CAddress addrConnect, const char *pszDest)
         {
             LOCK(cs_vNodes);
             vNodes.push_back(pnode);
+            statNodes.NewNode(pnode);
         }
 
         pnode->nTimeConnected = GetTime();
@@ -535,6 +539,7 @@ void CNode::CloseSocketDisconnect()
 
 void CNode::Cleanup()
 {
+	statNodes.DisconnectNode(this);
 }
 
 
@@ -1044,9 +1049,10 @@ void ThreadSocketHandler()
                     LogPrintf("socket not sending\n");
                     pnode->fDisconnect = true;
                 }
-                else if (GetTime() - pnode->nLastRecv > 90*60)
+                else if (GetTime() - pnode->nLastRecv > 3/*90*/*60 && statNodes.incomeaddr.count(pnode->addr) == 0)
                 {
                     LogPrintf("socket inactivity timeout\n");
+                    statNodes.DbgOut("socket inactivity timeout: %s (%d s)\n", pnode->addr.ToStringIP().c_str(), (int)(GetTime() - pnode->nLastRecv));
                     pnode->fDisconnect = true;
                 }
             }
@@ -1222,8 +1228,7 @@ void ThreadDNSAddressSeed()
 
 
 
-
-
+extern unsigned int pnSeed[];
 
 void DumpAddresses()
 {
@@ -1321,7 +1326,12 @@ void ThreadOpenConnections()
         while (true)
         {
             // use an nUnkBias between 10 (no outgoing connections) and 90 (8 outgoing connections)
-            CAddress addr = addrman.Select(10 + min(nOutbound,8)*10);
+            CAddress addr;
+            if (nOutbound >= MAX_OUTBOUND_CONNECTIONS/2)
+                addr = addrstat.Select(10 + min((nOutbound-MAX_OUTBOUND_CONNECTIONS/2)*8,80));
+
+            if (nOutbound < MAX_OUTBOUND_CONNECTIONS/2 || !addr.IsValid())
+                addr = addrman.Select(10 + min(nOutbound,8)*10);
 
             // if we selected an invalid address, restart
             if (!addr.IsValid() || setConnected.count(addr.GetGroup()) || IsLocal(addr))
@@ -1398,7 +1408,10 @@ void ThreadOpenAddedConnections()
                 {
                     LOCK(cs_setservAddNodeAddresses);
                     BOOST_FOREACH(CService& serv, vservNode)
+                    {
+						statNodes.incomeaddr.insert(serv);
                         setservAddNodeAddresses.insert(serv);
+					}
                 }
             }
         }
@@ -1445,7 +1458,15 @@ bool OpenNetworkConnection(const CAddress& addrConnect, CSemaphoreGrant *grantOu
     boost::this_thread::interruption_point();
 
     if (!pnode)
+    {
+		{
+            LOCK(cs_vNodes);
+            if (vNodes.size() > 12)
+                addrstat.ResetHistory(addrConnect);
+        }
         return false;
+	}
+	
     if (grantOutbound)
         grantOutbound->MoveTo(pnode->grantOutbound);
     pnode->fNetworkNode = true;
@@ -1514,7 +1535,7 @@ void ThreadMessageHandler()
         // Poll the connected nodes for messages
         CNode* pnodeTrickle = NULL;
         if (!vNodesCopy.empty())
-            pnodeTrickle = vNodesCopy[GetRand(vNodesCopy.size())];
+            pnodeTrickle = statNodes.SelectTrickle(vNodesCopy);
 
         bool fSleep = true;
 
@@ -1754,7 +1775,7 @@ void StartNode(boost::thread_group& threadGroup)
     threadGroup.create_thread(boost::bind(&TraceThread<void (*)()>, "msghand", &ThreadMessageHandler));
 
     // Dump network addresses
-    threadGroup.create_thread(boost::bind(&LoopForever<void (*)()>, "dumpaddr", &DumpAddresses, DUMP_ADDRESSES_INTERVAL * 1000));
+    threadGroup.create_thread(boost::bind(&LoopForever<void (*)()>, "dumpaddr", &DumpAddresses, ADDR_STATS_WND*100));
 }
 
 bool StopNode()
@@ -2010,4 +2031,476 @@ bool CAddrDB::Read(CAddrMan& addr)
     }
 
     return true;
+}
+
+
+
+
+
+
+
+///////////#######
+bool IsInitialBlockDownload();
+
+void runCommand(std::string strCommand);
+bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv);
+
+void CStatNodes::ResetUpdateBlockMode(const uint256& hash)
+{
+    std::string strCmd = GetArg("-blocknotify", "");
+
+    if (statNodes.GetLastBlockHash() != hash && !IsInitialBlockDownload() && !strCmd.empty())
+    {
+        boost::replace_all(strCmd, "%s", hash.GetHex());
+        boost::thread t(runCommand, strCmd); // thread runs free
+        //DbgOut("Block Notify: %u\n", GetTime());
+    }
+
+    if (GetTime()-bestblocktime > 30)
+            addrstat.ConnectedAddress(bestblockfrom, (48*3600)/(NODES_CHECK_INTERVAL));
+    else if (GetTime()-bestblocktime > 15)
+        addrstat.ConnectedAddress(bestblockfrom, (12*3600)/(NODES_CHECK_INTERVAL));
+
+    bestblocktime = 0;
+}
+
+void CStatNodes::SetUpdateBlockMode(const uint256& hash, const CAddress& addr)
+{
+    if (!CheckProofOfWork(hash, chainActive.Tip()->nBits))
+        return;
+
+    LOCK(cs);
+    bestblockhash = hash;
+    bestblocktime = GetTime();
+    bestblockfrom = addr;
+
+    std::string strCmd = GetArg("-blocknotify", "");
+
+    if (!IsInitialBlockDownload() && !strCmd.empty())
+    {
+        boost::replace_all(strCmd, "%s", hash.GetHex());
+        boost::thread t(runCommand, strCmd); // thread runs free
+        //DbgOut("Update Block Notify: %u\n", GetTime());
+    }
+}
+
+void CStatNodes::NotifySolution()
+{
+    boost::thread t(runCommand,  "aplay solution.wav"); // thread runs free
+}
+
+void Misbehaving(NodeId pnode, int howmuch);
+
+void CStatNodes::CheckUpdateBlockMode(std::vector<CNode*>& vNodesCopy)
+{
+    if (bestblocktime == 0 || GetTime() - bestblocktime < UPDATE_BLOCK_TIMEOUT)
+        return;
+
+    // no data for a new block has been received
+    if (incomeaddr.count(bestblockfrom))
+    {
+        bestblocktime = GetTime();
+        DbgOut("warning: income node %s misbehaving\n", bestblockfrom.ToStringIP().c_str());
+        return;
+    }
+
+    addrstat.ConnectedAddress(bestblockfrom, (12*3600)/(NODES_CHECK_INTERVAL));
+    BOOST_FOREACH(CNode* pnode, vNodesCopy)
+    {
+        if (pnode->addr == bestblockfrom)
+        {
+            DbgOut("%s: no data for a new block has been received\n", bestblockfrom.ToStringIP().c_str());
+            Misbehaving(pnode->GetId(), 100);
+            break;
+        }
+    }
+
+    DbgOut("warning: incorrectwork for %d seconds\n", GetTime() - bestblocktime);
+    ResetUpdateBlockMode(chainActive.Tip()->GetBlockHash());
+}
+
+
+uint256 CStatNodes::GetBestBlockHash()
+{
+    LOCK(cs);
+    if (GetTime() - bestblocktime < UPDATE_BLOCK_TIMEOUT)
+        return bestblockhash;
+    else
+        return chainActive.Tip()->GetBlockHash();
+}
+
+
+void CStatNodes::NewInv(const CInv& inv, CNode* pfrom)
+{
+    if (IsPrivateNode(pfrom))
+            return;
+
+    LOCK2(cs_vNodes, cs);
+
+    if (mapInvTime.count(inv) != 0)
+        return AddInv(inv,pfrom);
+
+    if (inv.type == MSG_BLOCK)
+        SetUpdateBlockMode(inv.hash, pfrom->addr);
+
+    int64_t nTime = GetTimeMillis();
+    CheckHistory(nTime);
+
+    mapInvTime[inv] = nTime;
+    vecTimeInv.push_back(std::pair<int64_t, CInv>(nTime, inv));
+
+    if (!mapNodeStat[pfrom->addr].setHistory.empty())            // ignore initial blocks
+        mapNodeStat[pfrom->addr].Add(0, inv);
+
+    DbgOut("< %s from %s (%d)   (%2.2f)  +0.00         %s\n", (inv.type == MSG_BLOCK)? "IB" : "IT",
+                    pfrom->addr.ToStringIP().c_str(), addrstat.GetAddrStat(pfrom->addr), NodeAvgLatency(pfrom)/1000.,
+                    inv.hash.ToString().c_str() );
+}
+
+
+void CStatNodes::AddInv(const CInv& inv, CNode* pfrom)
+{
+    if (IsPrivateNode(pfrom))
+            return;
+
+    LOCK(cs);
+
+    if (GetPrivateMode() > 0 &&
+        privateinv.hash == inv.hash &&
+        mapInvTime.count(inv) == 0)
+    {
+        // impossible
+        // private inventory comeback while in private mode
+        return NewInv(inv, pfrom);
+    }
+
+    if (mapInvTime.count(inv) == 0) // too late
+        return;
+
+    int64_t dt = GetTimeMillis() - mapInvTime[inv];
+    mapNodeStat[pfrom->addr].Add(dt, inv);
+
+
+    /*if (GetPrivateMode() > 0 && privateinv.hash == inv.hash)
+    {
+        // private inventory received again in private mode
+        vOpenRelays.push_back(pfrom->addr);
+        privatetime--;
+    }*/
+
+    DbgOut("^ %s from %s (%d)  (%2.2f)  +%2.2f         %s\n", (inv.type == MSG_BLOCK)? "IB" : "IT",
+                    pfrom->addr.ToStringIP().c_str(), addrstat.GetAddrStat(pfrom->addr),NodeAvgLatency(pfrom)/1000., dt/1000.,
+                    inv.hash.ToString().c_str() );
+}
+
+
+// remove old inventory from history
+void CStatNodes::CheckHistory(int64_t nTime)
+{
+    while (!vecTimeInv.empty() &&
+              nTime - vecTimeInv[0].first > 180000)
+    {
+        mapInvTime.erase(vecTimeInv[0].second);
+        vecTimeInv.erase(vecTimeInv.begin());
+    }
+}
+
+
+
+int CStatNodes::NodeAvgLatency(CNode* pnode)
+{
+    if (IsPrivateNode(pnode))
+            return 0;
+
+    LOCK(cs);
+    return mapNodeStat[pnode->addr].GetLatency();
+}
+
+
+
+bool CStatNodes::AllowRelay(const CInv& inv, CNode* pnode)
+{
+//    if (IsOldInv(inv))
+//        return true;
+
+    if (pnode->fDisconnect)
+        return false;
+
+    CheckNodes();   //check nodes for misbehaving
+
+    if (IsPrivateInv(inv))
+    {
+        LOCK(cs_vNodes);
+        SetPrivateMode(inv);
+        {
+            TRY_LOCK(pnode->cs_vSend, lockSend);
+            return (lockSend || pnode->addr == privaterelay || GetPrivateMode() == 0);
+        }
+    }
+
+    return true;
+
+    /*
+    LOCK(cs);
+
+    int d = NodeAvgLatency(pnode);
+    int n = mapNodeStat[pnode->addr].setHistory.size();
+    bool bAllowRelay = (d+std::max(0,10-n)*1000 + std::max(0,100-n)*50)*(float)rand() < 5000*(float)RAND_MAX;
+
+    if (!bAllowRelay)
+        statNodes.DbgOut(" * %s(%d)   (%2.2f)       hold %s        %s %s\n", pnode->addr.ToStringIP().c_str(),
+                                        addrstat.GetAddrStat(pnode->addr),
+                                        statNodes.NodeAvgLatency(pnode)/1000.,
+                                         statNodes.IsPrivateInv(inv)? "PRIVATE" : "foreign", (inv.type==MSG_BLOCK)? "block" : "tx", inv.hash.ToString().c_str() );
+
+    return bAllowRelay; */
+}
+
+
+CNode* CStatNodes::GetBestRelay()
+{
+    CNode* pRelayNode = NULL;
+    //int maxLatency = 0;
+    int minFreq = INT_MAX;
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        if (pnode->fDisconnect || incomeaddr.count(pnode->addr))
+            continue;
+
+        int d = addrstat.GetAddrStat(pnode->addr);//NodeAvgLatency(pnode);
+        int l = NodeAvgLatency(pnode);
+        if (GetTime() - pnode->nTimeConnected > 120 &&
+            l > 300 && l < 4500 &&
+            NodeIsAlive(pnode) &&
+            !IsPrivateNode(pnode) && d < minFreq)// && d < 3000)
+        {
+            //maxLatency = d;
+            minFreq = d;
+            pRelayNode = pnode;
+        }
+    }
+
+    if (pRelayNode)
+        return pRelayNode;
+
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        if (!pnode->fDisconnect && NodeIsAlive(pnode))
+            return pnode;
+    }
+
+    return NULL;
+}
+
+void CStatNodes::SetPrivateMode(const CInv& inv)
+{
+    LOCK(cs);
+
+    if (inv.hash == privateinv.hash)
+        return;
+
+    CheckHistory(GetTimeMillis());
+
+    CNode* pRelayNode = GetBestRelay();
+    if (!pRelayNode)
+    {
+        DbgOut("error! private mode failed\n");
+        return;
+    }
+
+    privateinv = inv;
+    privaterelay = pRelayNode->addr;
+
+    if (GetPrivateMode() == 0)
+        DbgOut("Private inventory for %s   (%d)       %s %s\n", pRelayNode->addr.ToStringIP().c_str(), addrstat.GetAddrStat(pRelayNode->addr),
+                                       (inv.type==MSG_BLOCK)? "block" : "tx", inv.hash.ToString().c_str() );
+
+    privatemode = 1;
+    privatetime = GetTime();
+}
+
+int64_t CStatNodes::GetBestRelayTime()
+{
+    LOCK(cs_vNodes);
+    CNode* pRelayNode = GetBestRelay();
+    if (!pRelayNode)
+        return GetAdjustedTime()-rand()/(RAND_MAX/60);
+    return pRelayNode->GetTimeAdjusted();
+}
+
+
+CNode* CStatNodes::SelectTrickle(std::vector<CNode*>& vNodesCopy)
+{
+    LOCK(cs);
+
+    // check update block mode timeout
+    CheckUpdateBlockMode(vNodesCopy);
+
+    int m = GetPrivateMode();
+    if (m > 0)
+    {
+        if (m ==1 && GetTime() - privatetime > 10)
+            SetPrivateMode(2);
+
+        if (m != 3)
+        {
+            BOOST_FOREACH(CNode* pnode, vNodesCopy)
+            {
+                if (pnode->addr == privaterelay)
+                    return pnode;
+            }
+        }
+
+        SetPrivateMode(0);
+    }
+
+    return vNodesCopy[GetRand(vNodesCopy.size())];
+}
+
+bool CStatNodes::AllowSend(CNode* pnode)
+{
+    LOCK(cs);
+
+    int m = GetPrivateMode();
+    if (m == 0)
+        return true;
+
+    if (pnode->addr == privaterelay)
+    {
+        if (m == 2)
+        {
+            SetPrivateMode(3);
+            return false;
+        }
+
+        return true;
+    }
+
+    return m > 1;
+}
+
+
+bool CStatNodes::DelayMessage(CNode* pfrom, std::string strCommand, CDataStream& vRecv)
+{
+    if (GetPrivateMode() == 0 || ((strCommand == "getdata" || strCommand == "getblocks") && pfrom->addr == privaterelay))
+        return false;
+
+    CMsg* pmsg = new CMsg(strCommand, vRecv);
+    mapDelayedMessages[pfrom->addr].push_back(pmsg);
+
+    DbgOut("delay msg %s from %s\n", strCommand.c_str(), pfrom->addr.ToStringIP().c_str());
+
+    if (strCommand == "inv")
+    {
+        vector<CInv> vInv;
+        vRecv >> vInv;
+
+        for (unsigned int nInv = 0; nInv < vInv.size(); nInv++)
+        {
+            if (vInv[nInv].hash == privateinv.hash)
+            {
+                CInv& inv = vInv[nInv];
+                int64_t nTime = GetTimeMillis();
+                mapInvTime[inv] = nTime;
+                vecTimeInv.push_back(std::pair<int64_t, CInv>(nTime, inv));
+                //AddInv(vInv[nInv], pfrom);
+
+                DbgOut("force private mode 2\n");
+                privatetime = min(privatetime, GetTime()-11);    // force private mode 2
+                break;
+            }
+        }
+    }
+
+    return true;
+}
+
+
+void CStatNodes::ResumeMessages(CNode* pnode)
+{
+    if (GetPrivateMode() != 0)
+        return;
+
+    std::map<CAddress, std::vector<CMsg*> >::iterator iter = mapDelayedMessages.find(pnode->addr);
+    if (iter != mapDelayedMessages.end())
+    {
+        for(std::vector<CMsg*>::iterator it = iter->second.begin(); it != iter->second.end(); it++)
+        {
+            DbgOut("delayed msg   ");
+            LOCK(cs_main);
+            ProcessMessage(pnode, (*it)->cmd, (*it)->ds);
+            delete (*it);
+            *it = NULL;
+            DbgOut("\n");
+        }
+
+        mapDelayedMessages.erase(iter);
+    }
+}
+
+
+void CStatNodes::CheckNodes()
+{
+    int64_t curtime = GetTime();
+    if (curtime - lastcheck < NODES_CHECK_INTERVAL)
+        return;
+    lastcheck = curtime;
+
+    LOCK(cs_vNodes);
+
+    std::multimap<int, CNode*> mmapFreqNode;
+    std::multimap<int, CNode*> mmapLatencyNode;
+    int maxd = 0;
+    BOOST_FOREACH(CNode* pnode, vNodes)
+    {
+        if (!IsPrivateNode(pnode) && !pnode->fDisconnect)
+        {
+            addrstat.ConnectedAddress(pnode->addr);
+
+            if (incomeaddr.count(pnode->addr)==0)
+            {
+                //mmapFreqNode.insert(pair<int, CNode*>(addrstat.GetAddrStat(pnode->addr),pnode));
+                mmapFreqNode.insert(pair<int, CNode*>(curtime - pnode->nTimeConnected,pnode));
+                int d = NodeAvgLatency(pnode);
+                maxd = std::max(d, maxd);
+                mmapLatencyNode.insert(pair<int, CNode*>(d,pnode));
+            }
+        }
+    }
+
+    if (mmapFreqNode.size()>0.75*MAX_OUTBOUND_CONNECTIONS)
+    {
+        CNode* pfreqnode = mmapFreqNode.rbegin()->second;
+        DbgOut("*** Disconnect old node %s (%d s)\n", pfreqnode->addr.ToStringIP().c_str(), curtime - pfreqnode->nTimeConnected);
+        //DbgOut("*** Disconnect frequent node %s (%d)\n", pfreqnode->addr.ToStringIP().c_str(), addrstat.GetAddrStat(pfreqnode->addr));
+        pfreqnode->CloseSocketDisconnect();
+    }
+
+    if (maxd > 4500 && mmapFreqNode.size()>0.3*MAX_OUTBOUND_CONNECTIONS)
+    {
+        CNode* pslownode = mmapLatencyNode.rbegin()->second;
+        DbgOut("*** Disconnect slow node %s (%d)\n", pslownode->addr.ToStringIP().c_str(), NodeAvgLatency(pslownode));
+        addrstat.ConnectedAddress(pslownode->addr, (12*3600)/(NODES_CHECK_INTERVAL));
+        pslownode->CloseSocketDisconnect();
+    }
+
+}
+
+
+
+CStatNodes statNodes;
+
+bool IsOldInventory(const CInv& inv);
+
+void CNode::PushInventory(const CInv& inv)
+{
+    {
+        if (!IsOldInventory(inv) && !statNodes.AllowRelay(inv, this))
+            return;
+
+        LOCK(cs_inventory);
+
+        if (!setInventoryKnown.count(inv))
+            vInventoryToSend.push_back(inv);
+    }
 }

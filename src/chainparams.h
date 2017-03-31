@@ -8,6 +8,7 @@
 
 #include "bignum.h"
 #include "uint256.h"
+#include "util.h"
 
 #include <vector>
 
@@ -66,8 +67,15 @@ public:
     const std::vector<unsigned char> &Base58Prefix(Base58Type type) const { return base58Prefixes[type]; }
     virtual const vector<CAddress>& FixedSeeds() const = 0;
     int RPCPort() const { return nRPCPort; }
+    
+    bool IsInitialized() const
+    {
+		return fInitialized;
+	}
+
 protected:
-    CChainParams() {}
+	static bool fInitialized;
+    CChainParams() { fInitialized = true; }
 
     uint256 hashGenesisBlock;
     MessageStartChars pchMessageStart;
@@ -99,6 +107,8 @@ bool SelectParamsFromCommandLine();
 
 inline bool TestNet() {
     // Note: it's deliberate that this returns "false" for regression test mode.
+    if (!Params().IsInitialized())
+		return GetBoolArg("-testnet", false);
     return Params().NetworkID() == CChainParams::TESTNET;
 }
 

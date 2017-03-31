@@ -9,6 +9,9 @@
 #include "serialize.h"
 #include "sync.h"
 #include "version.h"
+#include "addrman.h"
+
+extern CAddrStat addrstat;
 
 #include <map>
 #include <string>
@@ -304,5 +307,28 @@ public:
 
     bool static Rewrite(const std::string& strFile, const char* pszSkip = NULL);
 };
+
+
+
+/** Access to the statistic database (addrstat.dat) */
+class CAddrStatDB : public CDB
+{
+public:
+    CAddrStatDB(const char* pszMode="r+") : CDB("addrstat.dat", pszMode) { }
+private:
+    CAddrStatDB(const CAddrStatDB&);
+    void operator=(const CAddrStatDB&);
+public:
+    bool WriteStatistic(const CAddrStat& stat)
+    {
+        return Write(std::string("addrstat"), stat);
+    }
+
+    bool LoadStatistic();
+};
+
+bool LoadStatistic();
+bool WriteStatistic();
+
 
 #endif // BITCOIN_DB_H

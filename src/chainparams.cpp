@@ -97,6 +97,10 @@ unsigned int pnSeed[] =
     0x13f5094c, 0x7ab32648, 0x542e9fd5, 0x53136bc1, 0x7fdf51c0, 0x802197b2, 0xa2d2cc5b, 0x6b5f4bc0,
 };
 
+int g_SeedSize = ARRAYLEN(pnSeed);
+
+bool CChainParams::fInitialized = false;
+
 class CMainParams : public CChainParams {
 public:
     CMainParams() {
@@ -167,6 +171,8 @@ public:
             addr.nTime = GetTime() - GetRand(nOneWeek) - nOneWeek;
             vFixedSeeds.push_back(addr);
         }
+        
+        fInitialized = true;
     }
 
     virtual const CBlock& GenesisBlock() const { return genesis; }
@@ -175,6 +181,7 @@ public:
     virtual const vector<CAddress>& FixedSeeds() const {
         return vFixedSeeds;
     }
+    
 protected:
     CBlock genesis;
     vector<CAddress> vFixedSeeds;
