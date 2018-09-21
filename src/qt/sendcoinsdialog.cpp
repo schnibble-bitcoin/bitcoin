@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <univalue.h>
 #include <qt/sendcoinsdialog.h>
 #include <qt/forms/ui_sendcoinsdialog.h>
 
@@ -211,6 +212,36 @@ SendCoinsDialog::~SendCoinsDialog()
     delete ui;
 }
 
+#include <QMessageBox>
+#include <QFile>
+#include <QTextStream>
+#include <rpc/server.h>
+#include <rpc/client.h>
+#include <qt/msgbox.h>
+#include <util.h>
+
+UniValue CallRPC(std::string strMethod, std::string arg = std::string())
+{
+    std::vector<std::string> vArgs;
+    if (!arg.empty())
+        vArgs.push_back(arg);
+    JSONRPCRequest request;
+    request.strMethod = strMethod;
+    request.params = RPCConvertValues(strMethod, vArgs);
+    request.fHelp = false;
+    //BOOST_CHECK(tableRPC[strMethod]);
+
+    rpcfn_type method = tableRPC[strMethod]->actor;
+    try {
+        UniValue result = (*method)(request);
+        return result;
+    }
+    catch (const UniValue& objError) {
+        throw std::runtime_error(find_value(objError, "message").get_str());
+    }
+}
+
+
 void SendCoinsDialog::on_sendButton_clicked()
 {
     if(!model || !model->getOptionsModel())
@@ -242,12 +273,12 @@ void SendCoinsDialog::on_sendButton_clicked()
 
     fNewRecipientAllowed = false;
     WalletModel::UnlockContext ctx(model->requestUnlock());
-    if(!ctx.isValid())
-    {
-        // Unlock wallet was cancelled
-        fNewRecipientAllowed = true;
-        return;
-    }
+    //~ if(!ctx.isValid())
+    //~ {
+        //~ // Unlock wallet was cancelled
+        //~ fNewRecipientAllowed = true;
+        //~ return;
+    //~ }
 
     // prepare transaction for getting txFee earlier
     WalletModelTransaction currentTransaction(recipients);
@@ -260,7 +291,7 @@ void SendCoinsDialog::on_sendButton_clicked()
 
     updateCoinControlState(ctrl);
 
-    prepareStatus = model->prepareTransaction(currentTransaction, ctrl);
+    prepareStatus = model->prepareTransaction(currentTransaction, ctrl, ctx.isValid());
 
     // process prepareStatus and on error generate message shown to user
     processSendCoinsReturn(prepareStatus,
@@ -543,6 +574,7 @@ void SendCoinsDialog::processSendCoinsReturn(const WalletModel::SendCoinsReturn 
     // This comment is specific to SendCoinsDialog usage of WalletModel::SendCoinsReturn.
     // WalletModel::TransactionCommitFailed is used only in WalletModel::sendCoins()
     // all others are used only in WalletModel::prepareTransaction()
+    UniValue result;
     switch(sendCoinsReturn.status)
     {
     case WalletModel::InvalidAddress:
@@ -575,6 +607,34 @@ void SendCoinsDialog::processSendCoinsReturn(const WalletModel::SendCoinsReturn 
         msgParams.first = tr("Payment request expired.");
         msgParams.second = CClientUIInterface::MSG_ERROR;
         break;
+    case WalletModel::NotSigned:
+        try {
+            result = CallRPC("decoderawtransaction", sendCoinsReturn.reasonCommitFailed.toStdString());
+        }
+        catch (std::runtime_error e)
+        {
+            QMessageBox::warning(
+                this,
+                e.what(), tr("Error decoding the unsigned transaction: ")+sendCoinsReturn.reasonCommitFailed);
+        }
+
+        //msgParams.first = tr("Unsigned transaction: %1").arg(sendCoinsReturn.reasonCommitFailed + QString("\n") + QString::fromStdString(result.write(2)));
+        //msgParams.second = CClientUIInterface::MSG_WARNING;
+
+        if (QDialog::Accepted == MsgBox::question("Do you want to save unsigned TX?", QString("Raw transaction in hex format: \n\n") + sendCoinsReturn.reasonCommitFailed + QString("\n\nRaw transaction in human readable format:\n\n") + QString::fromStdString(result.write(2)), "Save TX", "Cancel", this))
+        {
+            //Update incoming transactions
+            QFile outputFile(QString::fromStdString(gArgs.GetArg("-rawtxpath", "rawtx.txt")));
+
+            if (outputFile.open(QIODevice::ReadWrite | QFile::Text | QIODevice::Append))
+            {
+                QTextStream out( &outputFile );
+                out << sendCoinsReturn.reasonCommitFailed << endl;
+                outputFile.close();
+            }
+        }
+
+        return;
     // included to prevent a compiler warning.
     case WalletModel::OK:
     default:
@@ -770,6 +830,7 @@ void SendCoinsDialog::coinControlButtonClicked()
 {
     CoinControlDialog dlg(platformStyle);
     dlg.setModel(model);
+    connect(&dlg, SIGNAL(ChangeEdited(const QString &)), this, SLOT(coinControlChangeUpdated(const QString &)));
     dlg.exec();
     coinControlUpdateLabels();
 }
@@ -787,6 +848,12 @@ void SendCoinsDialog::coinControlChangeChecked(int state)
         coinControlChangeEdited(ui->lineEditCoinControlChange->text());
 
     ui->lineEditCoinControlChange->setEnabled((state == Qt::Checked));
+}
+void SendCoinsDialog::coinControlChangeUpdated(const QString& text)
+{
+	ui->lineEditCoinControlChange->setText(text);
+	ui->checkBoxCoinControlChange->setChecked(true);
+        coinControlChangeEdited(text);
 }
 
 // Coin Control: custom change address changed

@@ -58,8 +58,11 @@ private:
 
     TxViewDelegate *txdelegate;
     std::unique_ptr<TransactionFilterProxy> filter;
+    bool initSent;
 
 private Q_SLOTS:
+    void numBlocksChanged(int count, const QDateTime& blockDate, double nVerificationProgress, bool header);
+    void updateNumConnections(int numConnections);
     void updateDisplayUnit();
     void handleTransactionClicked(const QModelIndex &index);
     void updateAlerts(const QString &warnings);
