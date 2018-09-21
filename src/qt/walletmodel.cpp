@@ -123,7 +123,9 @@ bool WalletModel::validateAddress(const QString &address)
     return IsValidDestinationString(address.toStdString());
 }
 
-WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransaction &transaction, const CCoinControl& coinControl)
+#include <rpc/server.h>
+#include <core_io.h>
+WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransaction &transaction, const CCoinControl& coinControl, bool sign)
 {
     CAmount total = 0;
     bool fSubtractFeeFromAmount = false;
@@ -205,7 +207,8 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
         std::string strFailReason;
 
         auto& newTx = transaction.getWtx();
-        newTx = m_wallet->createTransaction(vecSend, coinControl, true /* sign */, nChangePosRet, nFeeRequired, strFailReason);
+        newTx = m_wallet->createTransaction(vecSend, coinControl, sign, nChangePosRet, nFeeRequired, strFailReason);
+
         transaction.setTransactionFee(nFeeRequired);
         if (fSubtractFeeFromAmount && newTx)
             transaction.reassignAmounts(nChangePosRet);
@@ -226,6 +229,9 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
         // belt-and-suspenders check)
         if (nFeeRequired > m_node.getMaxTxFee())
             return AbsurdFee;
+            
+        if (!sign)
+            return SendCoinsReturn(NotSigned, QString::fromStdString(EncodeHexTx(*newTx->tx, RPCSerializationFlags())));
     }
 
     return SendCoinsReturn(OK);

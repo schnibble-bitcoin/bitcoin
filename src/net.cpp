@@ -10,6 +10,9 @@
 #include <net.h>
 
 #include <banman.h>
+#include <univalue.h>
+#include <rpc/server.h>
+
 #include <chainparams.h>
 #include <clientversion.h>
 #include <consensus/consensus.h>

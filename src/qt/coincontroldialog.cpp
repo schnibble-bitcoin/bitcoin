@@ -18,6 +18,8 @@
 #include <txmempool.h>
 #include <qt/walletmodel.h>
 
+#include "qt/sendcoinsdialog.h"
+
 #include <wallet/coincontrol.h>
 #include <interfaces/node.h>
 #include <key_io.h>
@@ -378,7 +380,11 @@ void CoinControlDialog::viewItemChanged(QTreeWidgetItem* item, int column)
         else if (item->isDisabled()) // locked (this happens if "check all" through parent node)
             item->setCheckState(COLUMN_CHECKBOX, Qt::Unchecked);
         else
+        {
             coinControl()->Select(outpt);
+            QTreeWidgetItem* it = (item->parent() == 0)? item : item->parent();
+            Q_EMIT ChangeEdited(it->text(COLUMN_ADDRESS));
+        }
 
         // selection changed -> update labels
         if (ui->treeWidget->isEnabled()) // do not update on every click for (un)select all

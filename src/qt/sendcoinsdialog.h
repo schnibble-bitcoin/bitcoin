@@ -84,6 +84,7 @@ private Q_SLOTS:
     void coinControlButtonClicked();
     void coinControlChangeChecked(int);
     void coinControlChangeEdited(const QString &);
+    void coinControlChangeUpdated(const QString &);
     void coinControlUpdateLabels();
     void coinControlClipboardQuantity();
     void coinControlClipboardAmount();
