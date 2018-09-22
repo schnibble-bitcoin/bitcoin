@@ -459,13 +459,13 @@ void WalletModel::unsubscribeFromCoreSignals()
 }
 
 // WalletModel::UnlockContext implementation
-WalletModel::UnlockContext WalletModel::requestUnlock()
+WalletModel::UnlockContext WalletModel::requestUnlock(QString warningtext)
 {
     bool was_locked = getEncryptionStatus() == Locked;
     if(was_locked)
     {
         // Request UI to unlock wallet
-        Q_EMIT requireUnlock();
+        Q_EMIT requireUnlock(warningtext);
     }
     // If wallet is still locked, unlock was failed or cancelled, mark context as invalid
     bool valid = getEncryptionStatus() != Locked;

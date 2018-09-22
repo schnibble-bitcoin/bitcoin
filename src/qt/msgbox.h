@@ -3,32 +3,54 @@
 
 #include <QDialog>
 #include <QPushButton>
+
+
 class MsgBox : public QDialog
 {
     Q_OBJECT
 
-    QPushButton *button1;
-    QPushButton *button2;
-
 public:
-    MsgBox(QString title, QString msg, QString btn1, QString btn2 = QString(), QWidget *parent = nullptr, Qt::WindowFlags f = 0);
+    enum DialogCode
+    {
+        Cancel = 0,
+        First = 1,
+        Second = 2
+    };
+
+    MsgBox(QWidget *parent, QString title, QString msg, QString name1, QString name2 = QString(), QString name3 = QString(), Qt::WindowFlags f = 0);
     virtual ~MsgBox() {}
 
-    static int question(QString title, QString msg, QString btn1, QString btn2 = QString(), QWidget* parent = nullptr, Qt::WindowFlags f = 0)
+    static DialogCode question(QWidget* parent, QString title, QString msg, QString name1, QString name2 = QString(), QString name3 = QString(), Qt::WindowFlags f = 0)
     {
-        return MsgBox(title, msg, btn1, btn2, parent).exec();
+        return (DialogCode)MsgBox(parent, title, msg, name1, name2, name3, f).exec();
     }
+
+private:
+    const DialogCode code1 = First;
+    DialogCode code2;
+    DialogCode code3;
 
 public Q_SLOTS:
     void handleButton1()
     {
-        done(QDialog::Accepted);
+        done(code1);
     }
     void handleButton2()
     {
-        done(QDialog::Rejected);
+        done(code2);
+    }
+    void handleButton3()
+    {
+        done(code3);
     }
 };
 
+#include <univalue.h>
+UniValue InvokeRPC(std::string strMethod,
+                 std::string arg1 = std::string(),
+                 std::string arg2 = std::string(),
+                 std::string arg3 = std::string(),
+                 std::string arg4 = std::string(),
+                 std::string arg5 = std::string());
 
 #endif // MSGBOX_H

@@ -149,6 +149,7 @@ void WalletView::setWalletModel(WalletModel *_walletModel)
 
         // Ask for passphrase if needed
         connect(_walletModel, &WalletModel::requireUnlock, this, &WalletView::unlockWallet);
+        //connect(_walletModel, SIGNAL(requireUnlock(QString)), this, SLOT(unlockWallet(QString)));
 
         // Show progress dialog
         connect(_walletModel, &WalletModel::showProgress, this, &WalletView::showProgress);
@@ -178,6 +179,7 @@ void WalletView::processNewTransaction(const QModelIndex& parent, int start, int
 void WalletView::gotoOverviewPage()
 {
     setCurrentWidget(overviewPage);
+    overviewPage->update();
 }
 
 void WalletView::gotoHistoryPage()
@@ -274,14 +276,14 @@ void WalletView::changePassphrase()
     dlg.exec();
 }
 
-void WalletView::unlockWallet()
+void WalletView::unlockWallet(QString warningtext)
 {
     if(!walletModel)
         return;
     // Unlock wallet when requested by wallet model
     if (walletModel->getEncryptionStatus() == WalletModel::Locked)
     {
-        AskPassphraseDialog dlg(AskPassphraseDialog::Unlock, this);
+        AskPassphraseDialog dlg(AskPassphraseDialog::Unlock, this, warningtext);
         dlg.setModel(walletModel);
         dlg.exec();
     }

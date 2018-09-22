@@ -14,6 +14,7 @@
 #include <qt/transactionfilterproxy.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/walletmodel.h>
+#include <qt/msgbox.h>
 
 #include <QAbstractItemDelegate>
 #include <QPainter>
@@ -122,7 +123,10 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     currentWatchUnconfBalance(-1),
     currentWatchImmatureBalance(-1),
     txdelegate(new TxViewDelegate(platformStyle, this)),
-    initSent(false)
+    nBlocksReceived(0),
+    rawInitRead(false),
+    rawInitSent(false),
+    rawWaitForNetwork(false)
 {
     ui->setupUi(this);
 
@@ -260,124 +264,255 @@ void OverviewPage::setWalletModel(WalletModel *model)
 #include <QMessageBox>
 #include <QFile>
 #include <QTextStream>
-#include <rpc/server.h>
-#include <rpc/client.h>
+#include <qt/msgbox.h>
+#include <util.h>
 
-UniValue CallRPC1(std::string strMethod, std::string arg = std::string())
+void OverviewPage::readtxs()
 {
-    std::vector<std::string> vArgs;
-    if (!arg.empty())
-        vArgs.push_back(arg);
-    JSONRPCRequest request;
-    request.strMethod = strMethod;
-    request.params = RPCConvertValues(strMethod, vArgs);
-    request.fHelp = false;
-    //BOOST_CHECK(tableRPC[strMethod]);
+    txs.clear();
+    stxs.clear();
+    QFile inputFile(QString::fromStdString(gArgs.GetArg("-rawtxpath", "rawtx.txt")));
+    if (inputFile.open(QIODevice::ReadOnly))
+    {
+        QTextStream in(&inputFile);
+        while (!in.atEnd())
+        {
+            QString tx = in.readLine();
+            auto it = txs.begin();
+            for (; it != txs.end() && tx.compare(QString::fromStdString(*it)) != 0;
+                 ++it);
+            if (it == txs.end())
+            {
+                std::string tx_str = tx.toUtf8().constData();
 
-    rpcfn_type method = tableRPC[strMethod]->actor;
-    try {
-        UniValue result = (*method)(request);
-        return result;
-    }
-    catch (const UniValue& objError) {
-        throw std::runtime_error(find_value(objError, "message").get_str());
+                try {
+                    UniValue result = InvokeRPC("signrawtransaction", tx_str, "[]", "[]");
+                    if (find_value(result.get_obj(), "complete").get_bool()) {
+                        stxs.push_back(tx_str);
+                        continue;
+                    }
+                } catch (std::runtime_error e) {}
+
+                txs.push_back(tx_str);
+            }
+        }
+        inputFile.close();
     }
 }
 
-#include <qt/msgbox.h>
-#include <util.h>
+void OverviewPage::updatetxs()
+{
+    txs.insert(txs.end(), stxs.begin(), stxs.end());
+
+    QFile outputFile(QString::fromStdString(gArgs.GetArg("-rawtxpath", "rawtx.txt")));
+    if (txs.empty())
+    {
+        outputFile.remove();
+    }
+    else if (outputFile.open(QIODevice::ReadWrite | QFile::Text | QIODevice::Truncate))
+    {
+        QTextStream out( &outputFile );
+        //printf("Update rawtx.txt\n");
+        while(!txs.empty())
+        {
+            //printf("write: %s\n", txs.front().c_str());
+            out << QString::fromStdString(txs.front()) << endl;
+            txs.erase(txs.begin());
+        }
+        //printf("Done\n");
+        outputFile.close();
+    }
+}
+
+void OverviewPage::update()
+{
+    if (rawInitRead)
+        return;
+
+    readtxs();
+
+    if (!txs.empty()) {
+
+        QString utransactionstr = "transaction";
+        QString uitstr = "it";
+        QString txstr = " unsigned TX";
+        if (txs.size() > 1)
+        {
+            txstr = " unsigned TX's";
+            utransactionstr = "transactions";
+            uitstr = "them";
+        }
+
+        QString stxstr = " signed TX";
+        if (stxs.size() > 1)
+            stxstr = " signed TX's";
+
+        QString message = QString::number(txs.size()) + txstr;
+        if (stxs.size() > 0)
+            message += QString(" and ") + QString::number(stxs.size()) + stxstr;
+
+        QString itstr = "it";
+        QString isstr = " is";
+        if (stxs.size() > 0 || txs.size() > 1)
+        {
+            itstr = "them";
+            isstr = " are";
+        }
+
+        message += QString(isstr + " found in the queue.\n\nIf you want to broadcast " + itstr + ", please wait for more connections with bitcoin network. Alternatively, you can only sign the unsigned "+utransactionstr+" and broadcast "+uitstr+" later.");
+
+        switch (MsgBox::question(this,
+                                 tr("Transactions in the queue"),
+                                 message,
+                                 "Wait for network", "Sign and update", "Cancel")) {
+        case MsgBox::First:
+            rawWaitForNetwork = true;
+            break;
+
+        case MsgBox::Second:
+            updateNumConnections(0);
+
+        case MsgBox::Cancel:
+
+        default:
+            break;
+        }
+    }
+
+    rawInitRead = true;
+}
+
 void OverviewPage::numBlocksChanged(int count, const QDateTime& blockDate, double nVerificationProgress, bool header)
 {
-    //printf("blocks num = %u\n", count);
-    updateNumConnections(8);
+    nBlocksReceived = 1;
+    if (gArgs.GetBoolArg("-regtest", false))
+        updateNumConnections(8);
 }
 
 void OverviewPage::updateNumConnections(int numConnections)
 {
-//    printf("num conn = %u\n",numConnections);
-    if (initSent || numConnections < 3)
-        return;
-
-    initSent = true;
-
-    // send prepared tx
-    std::vector<std::string> txs;
-
-    QFile inputFile(QString::fromStdString(gArgs.GetArg("-rawtxpath", "rawtx.txt")));
-    if (inputFile.open(QIODevice::ReadOnly))
+    bool fUpdated = false;
+    if (rawInitRead)
     {
-       QTextStream in(&inputFile);
-       while (!in.atEnd())
-       {
-          QString tx = in.readLine();
-          txs.push_back(tx.toUtf8().constData());
-       }
-       inputFile.close();
+        if (rawInitSent || numConnections+nBlocksReceived < 4)
+            return;
+
+        rawInitSent = true;
+
+        readtxs();
+
+        // process signed txs
+        for (auto it=stxs.begin(); it != stxs.end(); )
+        {
+            const std::string& stx = *it;
+            UniValue result;
+            result = InvokeRPC("decoderawtransaction", stx);
+
+            switch (MsgBox::question(this,
+                                     tr("A signed transaction has been found in the queue"),
+                                     QString("Previously signed transaction is ready to be broadcasted!\nDo you want to broadcast this transaction now?\n\nSigned transaction in hex format: \n\n") + QString::fromStdString(stx) + QString("\n\nSigned transaction in human readable format:\n\n") + QString::fromStdString(result.write(2)),
+                                     "Broadcast", "Delete", "Keep in queue" ))
+            {
+                case MsgBox::First:
+                    result = InvokeRPC("sendrawtransaction", stx);
+                    QMessageBox::information(this, tr("Transaction has been sent"), QString("TXID: ") + QString::fromStdString(result.write(2)));
+
+                  case MsgBox::Second:
+                    it = stxs.erase(it);
+                    fUpdated = true;
+                    continue;
+                  case MsgBox::Cancel:
+                  default:
+                    break;
+            }
+            it++;
+        }
     }
 
-    if (txs.size() > 0)
+    // process unsigned txs
+    if (rawWaitForNetwork || !rawInitRead)
     {
-        WalletModel::UnlockContext ctx1(walletModel->requestUnlock());
+        if (rawInitRead)
+            rawWaitForNetwork = false;
+
+        bool fUpdateSigned = false;
+        WalletModel::UnlockContext ctx1(walletModel->requestUnlock("Please enter your wallet passphrase if you want to sign transactions in the queue."));
         if(ctx1.isValid())
         {
-            //for(std::string tx: txs)
             for (auto it=txs.begin(); it != txs.end(); )
             {
                 const std::string& tx = *it;
                 UniValue result;
                 try {
-                    result = CallRPC1("signrawtransaction", tx);
+                    result = InvokeRPC("signrawtransaction", tx);
 
                     if (find_value(result.get_obj(), "complete").get_bool())
                     {
                         std::string txhex = find_value(result.get_obj(), "hex").get_str();
-                        result = CallRPC1("decoderawtransaction", txhex);
+                        result = InvokeRPC("decoderawtransaction", txhex);
 
-                        switch( MsgBox::question(
-                                    tr("Do you want to broadcast signed transaction?"),
-                                    QString("Transaction successfully signed! Do you want to broadcast this transaction?\n\nSigned transaction in hex format: \n\n") + QString::fromStdString(txhex) + QString("\n\nSigned transaction in human readable format:\n\n") + QString::fromStdString(result.write(2)),
-                                    "Yes", "No", this ) )
+                        MsgBox::DialogCode answer;
+                        QString message;
+
+                        if (rawInitRead)
                         {
-                          case QDialog::Accepted:
-                            result = CallRPC1("sendrawtransaction", txhex);
+                            answer = MsgBox::question(this,
+                                        tr("Do you want to broadcast signed transaction?"),
+                                        QString("The transaction is successfully signed!\nDo you want to broadcast this transaction?\n\nSigned transaction in hex format: \n\n") + QString::fromStdString(txhex) + QString("\n\nSigned transaction in human readable format:\n\n") + QString::fromStdString(result.write(2)),
+                                        "Yes", "No" );
+                            message = QString("This transaction won't be broadcasted. Do you want to update the original transaction to signed version or delete it?\n\n") + QString::fromStdString(tx);
+                        }
+                        else
+                        {
+                            answer = MsgBox::Cancel;
+                            message = QString("Transaction successfully signed!\nDo you want to replace the original transaction with the signed version or delete it?\n\n") + QString::fromStdString(result.write(2));
+                        }
 
-                            QMessageBox::information(this, tr("Transaction has been sent"), QString("TXID: ") + QString::fromStdString(result.write(2)));
+                        if (MsgBox::First == answer)
+                        {
+                            result = InvokeRPC("sendrawtransaction", txhex);
+
+                            QMessageBox::information(this, tr("The transaction has just sent"), QString("TXID: ") + QString::fromStdString(result.write(2)));
                             it = txs.erase(it);
+                            fUpdated = true;
                             continue;
-
-                          case QDialog::Rejected:
-
-                            //If "No" answered, ask whether we should delete this transaction
-                            switch( MsgBox::question(
-                                        tr("Do you want to delete this transaction?"),
-                                        QString::fromStdString("The transaction won't be broadcasted. Do you want to delete the original unsigned transaction from the text file?\n\n") + QString::fromStdString(tx),
-                                        "Delete", "Keep", this ) )
+                        }
+                        else if (MsgBox::Cancel == answer)
+                        {
+                            //If "No" answered ask whether we should delete or save this transaction
+                            switch( MsgBox::question(this,
+                                        tr("Do you want to update this transaction?"),
+                                        message,
+                                        "Update", "Delete", "Keep unsigned" ) )
                             {
-                              case QDialog::Accepted:
-                                it = txs.erase(it);
-                                continue;
+                              case MsgBox::First:
+                                stxs.push_back(txhex);
+                                fUpdateSigned = true;
 
-                              case QDialog::Rejected:
+                              case MsgBox::Second:
+                                it = txs.erase(it);
+                                fUpdated = true;
+                              continue;
+
+                              case MsgBox::Cancel:
                               default:
                                 break;
                             }
-
-                          default:
-                            break;
                         }
 
                     } else {
                         //ask whether we should delete this transaction
-                        switch( MsgBox::question(
-                                    "Error signing the transaction!",
-                                    QString("Error signing the transaction! Do you want to delete the original unsigned transaction from the text file?\n\n---\nError details:\n\n" + QString::fromStdString(result.write(2))),
-                                    "Delete", "Keep", this ) )
+                        switch( MsgBox::question(this,
+                                    "Error while signing the transaction",
+                                    QString("Error while signing the transaction!\nDo you want to delete the original one from the text file?\n\n---\nError details:\n\n" + QString::fromStdString(result.write(2))),
+                                    "Delete", "Keep" ) )
                         {
-                          case QDialog::Accepted:
+                          case MsgBox::First:
                             it = txs.erase(it);
+                            fUpdated = true;
                             continue;
 
-                          case QDialog::Rejected:
+                          case MsgBox::Cancel:
                           default:
                             break;
                         }
@@ -386,45 +521,34 @@ void OverviewPage::updateNumConnections(int numConnections)
                 catch (std::runtime_error e)
                 {
                     //ask whether we should delete this transaction
-                    switch( MsgBox::question(
+                    switch( MsgBox::question(this,
                                 e.what(),
                                 QString("Error processing the transaction:\n\n") + QString::fromStdString(tx) + ("\n\nDo you want to delete this bad transaction from the text file?\n\n"
                                         "\n\n---\nError details:\n\n" + QString::fromStdString(e.what())),
-                                        "Delete", "Keep", this ) )
+                                        "Delete", "Keep" ) )
                     {
-                      case QDialog::Accepted:
+                      case MsgBox::First:
                         it = txs.erase(it);
+                        fUpdated = true;
                         continue;
 
-                      case QDialog::Rejected:
+                      case MsgBox::Cancel:
                       default:
                         break;
                     }
                 }
                 it++;
             }
-
-            //Update incoming transactions
-            QFile outputFile(QString::fromStdString(gArgs.GetArg("-rawtxpath", "rawtx.txt")));
-            if (txs.empty())
-            {
-                outputFile.remove();
-            }
-            else if (outputFile.open(QIODevice::ReadWrite | QFile::Text | QIODevice::Truncate))
-            {
-                QTextStream out( &outputFile );
-                //printf("Update rawtx.txt\n");
-                while(!txs.empty())
-                {
-                    //printf("write: %s\n", txs.front().c_str());
-                    out << QString::fromStdString(txs.front()) << endl;
-                    txs.erase(txs.begin());
-                }
-                //printf("Done\n");
-                outputFile.close();
-            }
         }
+
+        if (fUpdateSigned && !rawInitRead)
+            QMessageBox::information(this, "Updated transactions have not been broadcasted", "Some of the transactions have been signed but have not broadcasted yet. You will be prompted for broadcasting them later when there are enough connections with the bitcoin network.");
     }
+
+
+    //Update incoming transactions
+    if (fUpdated)
+        updatetxs();
 }
 
 void OverviewPage::updateDisplayUnit()
