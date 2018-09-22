@@ -36,6 +36,9 @@ public:
     void setClientModel(ClientModel *clientModel);
     void setWalletModel(WalletModel *walletModel);
     void showOutOfSyncWarning(bool fShow);
+    void update();
+    void readtxs();
+    void updatetxs();
 
 public Q_SLOTS:
     void setBalance(const CAmount& balance, const CAmount& unconfirmedBalance, const CAmount& immatureBalance,
@@ -58,7 +61,12 @@ private:
 
     TxViewDelegate *txdelegate;
     std::unique_ptr<TransactionFilterProxy> filter;
-    bool initSent;
+    int nBlocksReceived;
+    bool rawInitRead;
+    bool rawInitSent;
+    bool rawWaitForNetwork;
+    std::vector<std::string> txs;
+    std::vector<std::string> stxs;
 
 private Q_SLOTS:
     void numBlocksChanged(int count, const QDateTime& blockDate, double nVerificationProgress, bool header);
