@@ -35,6 +35,15 @@ class WalletView : public QStackedWidget
 {
     Q_OBJECT
 
+    enum RAWSignState
+    {
+        Init,
+        WaitForSigning,
+        SignOnly,
+        WaitForBroadcast,
+        Cancel
+    };
+
 public:
     explicit WalletView(const PlatformStyle *platformStyle, QWidget *parent);
     ~WalletView();
@@ -54,6 +63,9 @@ public:
 
     void showOutOfSyncWarning(bool fShow);
 
+    void readtxs();
+    void updatetxs();
+
 private:
     ClientModel *clientModel;
     WalletModel *walletModel;
@@ -70,7 +82,13 @@ private:
     QProgressDialog *progressDialog;
     const PlatformStyle *platformStyle;
 
+    int nBlocksReceived;
+    RAWSignState rawSignState;
+    std::vector<std::string> txs;
+    std::vector<std::string> stxs;
+
 public Q_SLOTS:
+    void update();
     /** Switch to overview (home) page */
     void gotoOverviewPage();
     /** Switch to history (transactions) page */
@@ -112,6 +130,10 @@ public Q_SLOTS:
 
     /** User has requested more information about the out of sync state */
     void requestedSyncWarningInfo();
+
+private Q_SLOTS:
+    void numBlocksChanged(int count, const QDateTime& blockDate, double nVerificationProgress, bool header);
+    void updateNumConnections(int numConnections);
 
 Q_SIGNALS:
     /** Signal that we want to show the main window */
