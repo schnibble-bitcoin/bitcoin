@@ -122,9 +122,7 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     currentWatchImmatureBalance(-1),
     txdelegate(new TxViewDelegate(platformStyle, this)),
     nBlocksReceived(0),
-    rawInitRead(false),
-    rawInitSent(false),
-    rawWaitForNetwork(false)
+    rawSignState(Init)
 {
     ui->setupUi(this);
 
@@ -317,8 +315,10 @@ void OverviewPage::updatetxs()
 
 void OverviewPage::update()
 {
-    if (rawInitRead)
+    if (rawSignState != Init)
         return;
+
+    rawSignState = WaitForBroadcast;
 
     readtxs();
 
@@ -357,20 +357,22 @@ void OverviewPage::update()
                                  message,
                                  "Wait for network", "Sign and update", "Cancel")) {
         case MsgBox::First:
-            rawWaitForNetwork = true;
+            rawSignState = WaitForSigning;
             break;
 
         case MsgBox::Second:
+            rawSignState = SignOnly;
             updateNumConnections(0);
+            rawSignState = WaitForBroadcast;
+            break;
 
         case MsgBox::Cancel:
+            rawSignState = Cancel;
 
         default:
             break;
         }
     }
-
-    rawInitRead = true;
 }
 
 void OverviewPage::numBlocksChanged(int count, const QDateTime& blockDate, double nVerificationProgress, bool header)
@@ -382,13 +384,19 @@ void OverviewPage::numBlocksChanged(int count, const QDateTime& blockDate, doubl
 
 void OverviewPage::updateNumConnections(int numConnections)
 {
-    bool fUpdated = false;
-    if (rawInitRead)
-    {
-        if (rawInitSent || numConnections+nBlocksReceived < 4)
-            return;
+    RAWSignState signState = rawSignState;
+    rawSignState = Cancel;
 
-        rawInitSent = true;
+    if (signState == Cancel)
+        return;
+
+    bool fUpdated = false;
+    bool fUpdateSigned = false;
+
+    if (signState == WaitForSigning || signState == WaitForBroadcast)
+    {
+        if (numConnections+nBlocksReceived < 4)
+            return;
 
         readtxs();
 
@@ -400,7 +408,7 @@ void OverviewPage::updateNumConnections(int numConnections)
             result = InvokeRPC("decoderawtransaction", stx);
 
             switch (MsgBox::question(this,
-                                     tr("A signed transaction has been found in the queue"),
+                                     tr("A signed transaction is found in the queue"),
                                      QString("Previously signed transaction is ready to be broadcasted!\nDo you want to broadcast this transaction now?\n\nSigned transaction in hex format: \n\n") + QString::fromStdString(stx) + QString("\n\nSigned transaction in human readable format:\n\n") + QString::fromStdString(result.write(2)),
                                      "Broadcast", "Delete", "Keep in queue" ))
             {
@@ -421,14 +429,11 @@ void OverviewPage::updateNumConnections(int numConnections)
     }
 
     // process unsigned txs
-    if (rawWaitForNetwork || !rawInitRead)
-    {
-        if (rawInitRead)
-            rawWaitForNetwork = false;
 
-        bool fUpdateSigned = false;
-        WalletModel::UnlockContext ctx1(walletModel->requestUnlock("Please enter your wallet passphrase if you want to sign transactions in the queue."));
-        if(ctx1.isValid())
+    if ((signState != WaitForBroadcast) && (txs.size() > 0))
+    {
+        WalletModel::UnlockContext ctx(walletModel->requestUnlock("Please enter your wallet passphrase if you want to sign transactions in the queue."));
+        if(ctx.isValid())
         {
             for (auto it=txs.begin(); it != txs.end(); )
             {
@@ -445,7 +450,7 @@ void OverviewPage::updateNumConnections(int numConnections)
                         MsgBox::DialogCode answer;
                         QString message;
 
-                        if (rawInitRead)
+                        if (signState != SignOnly)
                         {
                             answer = MsgBox::question(this,
                                         tr("Do you want to broadcast signed transaction?"),
@@ -531,15 +536,14 @@ void OverviewPage::updateNumConnections(int numConnections)
                 it++;
             }
         }
-
-        if (fUpdateSigned && !rawInitRead)
-            QMessageBox::information(this, "Updated transactions have not been broadcasted", "Some of the transactions have been signed but have not broadcasted yet. You will be prompted for broadcasting them later when there are enough connections with the bitcoin network.");
     }
-
 
     //Update incoming transactions
     if (fUpdated)
         updatetxs();
+
+    if (fUpdateSigned && signState == SignOnly)
+        QMessageBox::information(this, "Updated transactions have not been broadcasted", "Some of the transactions have been signed but have not broadcasted yet. You will be prompted for broadcasting them later when there are enough connections with the bitcoin network.");
 }
 
 void OverviewPage::updateDisplayUnit()

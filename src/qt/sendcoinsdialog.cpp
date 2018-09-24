@@ -596,7 +596,7 @@ void SendCoinsDialog::processSendCoinsReturn(const WalletModel::SendCoinsReturn 
                 e.what(), tr("Error decoding the unsigned transaction: ")+sendCoinsReturn.reasonCommitFailed);
         }
 
-        if (MsgBox::First == MsgBox::question(this, "Unsigned transaction", QString("Do you want to save this unsigned TX?\n\nRaw transaction in hex format: \n\n") + sendCoinsReturn.reasonCommitFailed + QString("\n\nRaw transaction in human readable format:\n\n") + QString::fromStdString(result.write(2)), "Save", "Cancel"))
+        if (MsgBox::First == MsgBox::question(this, "Unsigned transaction", QString("Do you want to save this unsigned transaction?\n\nRaw transaction in hex format: \n\n") + sendCoinsReturn.reasonCommitFailed + QString("\n\nRaw transaction in human readable format:\n\n") + QString::fromStdString(result.write(2)), "Save", "Cancel"))
         {
             //Update incoming transactions
             QFile outputFile(QString::fromStdString(gArgs.GetArg("-rawtxpath", "rawtx.txt")));
