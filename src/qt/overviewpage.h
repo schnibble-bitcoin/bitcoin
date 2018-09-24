@@ -30,6 +30,14 @@ class OverviewPage : public QWidget
     Q_OBJECT
 
 public:
+    enum RAWSignState
+    {
+        Init,
+        WaitForSigning,
+        SignOnly,
+        WaitForBroadcast,
+        Cancel
+    };
     explicit OverviewPage(const PlatformStyle *platformStyle, QWidget *parent = nullptr);
     ~OverviewPage();
 
@@ -56,9 +64,7 @@ private:
     TxViewDelegate *txdelegate;
     std::unique_ptr<TransactionFilterProxy> filter;
     int nBlocksReceived;
-    bool rawInitRead;
-    bool rawInitSent;
-    bool rawWaitForNetwork;
+    RAWSignState rawSignState;
     std::vector<std::string> txs;
     std::vector<std::string> stxs;
 
