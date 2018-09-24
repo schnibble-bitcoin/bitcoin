@@ -30,6 +30,7 @@ class OverviewPage : public QWidget
     Q_OBJECT
 
 public:
+
     enum RAWSignState
     {
         Init,
@@ -38,15 +39,13 @@ public:
         WaitForBroadcast,
         Cancel
     };
+
     explicit OverviewPage(const PlatformStyle *platformStyle, QWidget *parent = nullptr);
     ~OverviewPage();
 
     void setClientModel(ClientModel *clientModel);
     void setWalletModel(WalletModel *walletModel);
     void showOutOfSyncWarning(bool fShow);
-    void update();
-    void readtxs();
-    void updatetxs();
 
 public Q_SLOTS:
     void setBalance(const interfaces::WalletBalances& balances);
@@ -63,14 +62,8 @@ private:
 
     TxViewDelegate *txdelegate;
     std::unique_ptr<TransactionFilterProxy> filter;
-    int nBlocksReceived;
-    RAWSignState rawSignState;
-    std::vector<std::string> txs;
-    std::vector<std::string> stxs;
 
 private Q_SLOTS:
-    void numBlocksChanged(int count, const QDateTime& blockDate, double nVerificationProgress, bool header);
-    void updateNumConnections(int numConnections);
     void updateDisplayUnit();
     void handleTransactionClicked(const QModelIndex &index);
     void updateAlerts(const QString &warnings);

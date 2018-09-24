@@ -73,6 +73,7 @@ bool WalletFrame::addWallet(WalletModel *walletModel)
 
     connect(walletView, &WalletView::outOfSyncWarningClicked, this, &WalletFrame::outOfSyncWarningClicked);
 
+    walletView->update();
     return true;
 }
 
