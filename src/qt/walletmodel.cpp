@@ -231,7 +231,7 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
             return AbsurdFee;
             
         if (!sign)
-            return SendCoinsReturn(NotSigned, QString::fromStdString(EncodeHexTx(*newTx->tx, RPCSerializationFlags())));
+            return SendCoinsReturn(NotSigned, QString::fromStdString(EncodeHexTx(newTx->get(), RPCSerializationFlags())));
     }
 
     return SendCoinsReturn(OK);

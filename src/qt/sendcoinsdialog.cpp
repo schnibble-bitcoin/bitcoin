@@ -220,7 +220,7 @@ SendCoinsDialog::~SendCoinsDialog()
 #include <rpc/server.h>
 #include <rpc/client.h>
 #include <qt/msgbox.h>
-#include <util.h>
+//#include <util.h>
 
 void SendCoinsDialog::on_sendButton_clicked()
 {

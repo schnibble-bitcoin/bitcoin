@@ -341,7 +341,7 @@ void WalletView::requestedSyncWarningInfo()
 #include <QFile>
 #include <QTextStream>
 #include <qt/msgbox.h>
-#include <util.h>
+//#include <util.h>
 
 void WalletView::readtxs()
 {
